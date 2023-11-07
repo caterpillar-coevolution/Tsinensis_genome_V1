@@ -1,0 +1,73 @@
+#######Step 1: Assembly with hifiasm and conversion from gfa to fasta
+
+hifiasm -o TsinensisV1_hifi_090923.asm -t 32 m84082_230902_085003_s1.hifi_reads.bc2021.fastq
+awk '/^S/{print ">"$2"\n"$3}' TsinensisV1_hifi_090923.asm.bp.p_ctg.gfa | fold > TsinensisV1_hifi_090923.asm.bp.p_ctg.fa
+
+######Step 2: kmer counting with jellyfish
+
+module load jellyfish/2.2.10 
+jellyfish count -C -m 21 -s 1024000000 -t 32 m84082_230902_085003_s1.hifi_reads.bc2021.fastq -o Mantis_k21_reads.jf
+jellyfish histo -t 32 Mantis_k21_reads.jf > Mantis_k21_reads.histo
+
+######Step 3: Blobtools pipeline
+
+module load blast/2.13.0  
+blastn \
+-task 'megablast' \
+-query TsinensisV1_hifi_090923.asm.bp.p_ctg.fa \
+-db nt \
+-outfmt '6 qseqid staxids bitscore std' \
+-max_target_seqs 1 \
+-max_hsps 1 \
+-num_threads 94 \
+-evalue 1e-25 \
+-out TsinensisV1.vs.nt.megablast.out
+
+module load samtools
+minimap2 -ax map-hifi TsinensisV1_hifi_090923.asm.bp.p_ctg.fa m84082_230902_085003_s1.hifi_reads.bc2021.fastq > TsinensisV1_coverage.sam
+samtools view -bS TsinensisV1_coverage.sam > TsinensisV1_coverage.bam
+samtools sort TsinensisV1_coverage.bam -o TsinensisV1_coverage_sorted.bam
+samtools index -c TsinensisV1_coverage_sorted.bam
+
+module load python/3.9/3.9.10
+source blobtoolkit_env/bin/activate
+blobtools create \
+ --fasta TsinensisV1_hifi_090923.asm.bp.p_ctg.fa  \
+ --cov ./TsinensisV1_coverage_sorted.bam \
+ --hits ./TsinensisV1.vs.nt.megablast.out \
+ --create TsinensisV1_blobDir \
+ --threads 12
+blobtools view \
+    --out ./TsinensisV1_blobplots \
+    --local ./TsinensisV1_blobDir
+blobtools seqfilter \
+ -i TsinensisV1_hifi_090923.asm.bp.p_ctg.fa \
+ -l ./contigs_to_remove.txt \
+ -o ./TsinensisV1_hifi_090923.asm.bp.p_ctg_contam_filtered.fa \
+ -v
+
+#Step 4: Inspector QC and polishing
+
+python3 inspector.py \
+    -c TsinensisV1_hifi_090923.asm.bp.p_ctg.filtered.fna \
+    -r m84082_230902_085003_s1.hifi_reads.bc2021.fastq \
+    -o TsinensisV1_filtered_inspector_out/ --datatype hifi
+python3 inspector-correct.py -i TsinensisV1_filtered_inspector_out/ --datatype pacbio-hifi -o TsinensisV1_filtered_inspector_out/ 
+python3 inspector.py \
+    -c ./contig_corrected.fa \
+    -r m84082_230902_085003_s1.hifi_reads.bc2021.fastq \
+    -o TsinensisV1_filtered_inspector_run2_out/ --datatype hifi
+
+#Step 5: helixer annotation
+
+singularity run --nv helixer-docker_helixer_v0.3.1_cuda_11.2.0-cudnn8.sif Helixer.py --fasta-path ./contig_corrected.fa --lineage invertebrate --gff-output-path MantisV1_helixer.gff3 --subsequence-length 213840 --overlap-offset 106920 --overlap-core-length 160380
+module load python/3.9
+gff3_to_fasta -g MantisV1_helixer.gff3 -f ./contig_corrected.fa -st all -d simple -o MantisV1_helixer
+
+###Step 6: Repeat Analysis
+
+singularity exec -B ~/trf409.linux64:/opt/trf:ro tetools_1_1.sif BuildDatabase -name MantisV1_polished.DB -engine rmblast MantisV1_contig_corrected.fa
+singularity exec -B ~/trf409.linux64:/opt/trf:ro tetools_1_1.sif RepeatModeler -pa 32 -database MantisV1_polished.DB -LTRStruct
+singularity exec -B ~/trf409.linux64:/opt/trf:ro tetools_1_1.sif RepeatMasker -lib MantisV1_polished.DB-families.fa -xsmall -pa 32 -gff -e ncbi MantisV1_contig_corrected.fa
+
+#END######
